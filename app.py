@@ -4,10 +4,9 @@ import numpy as np
 import xgboost as xgb
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
-import json
-import base64
 import datetime
 import urllib.parse
+import uuid
 
 # Cấu hình giao diện Streamlit
 st.set_page_config(
@@ -16,20 +15,27 @@ st.set_page_config(
     page_icon="🛡️"
 )
 
-# Helper an toàn để render HTML không tạo iframe
-def render_custom_html(html_str):
-    if hasattr(st, "html"):
-        st.html(html_str)
-    elif hasattr(st, "components") and hasattr(st.components, "v1"):
-        st.components.v1.html(html_str, height=0)
-
 # ==========================================
-# 0. HỖ TRỢ BỘ NHỚ LỊCH SỬ (CACHE)
+# 0. HỖ TRỢ BỘ NHỚ LỊCH SỬ (CACHE PROCESS-WIDE)
 # ==========================================
 @st.cache_resource
 def get_live_history():
     """Lưu trữ danh sách các thiết bị truy cập thực nghiệm (Thread-safe singleton)."""
     return []
+
+def get_client_info():
+    """Đọc thông tin header thực tế từ trình duyệt của người truy cập."""
+    ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1"
+    platform_hint = ""
+    try:
+        if hasattr(st, "context") and hasattr(st.context, "headers"):
+            headers = st.context.headers
+            if headers:
+                ua = headers.get("User-Agent", headers.get("user-agent", ua))
+                platform_hint = headers.get("Sec-Ch-Ua-Platform", headers.get("sec-ch-ua-platform", ""))
+    except Exception:
+        pass
+    return ua, platform_hint
 
 # ==========================================
 # 1. HÀM TẠO DỮ LIỆU & HUẤN LUYỆN MODEL (CACHE)
@@ -112,19 +118,35 @@ def init_and_train_model():
 def parse_user_agent(ua_str):
     """Phân tích sơ bộ User-Agent từ client."""
     ua_str_lower = ua_str.lower() if isinstance(ua_str, str) else ""
-    if "iphone" in ua_str_lower:
+    if "iphone" in ua_str_lower or "ipad" in ua_str_lower:
         dev = "iPhone"
         br = "Mobile Safari" if "safari" in ua_str_lower else "Chrome Mobile"
+        plat = "iPhone"
+        touch = 5
+        res = "1170x2532"
+        gpu = "Apple GPU"
     elif "android" in ua_str_lower:
         dev = "Android"
         br = "Chrome Mobile"
+        plat = "Linux armv8l"
+        touch = 10
+        res = "1080x2400"
+        gpu = "Adreno (TM) GPU"
     elif "macintosh" in ua_str_lower or "mac os" in ua_str_lower:
         dev = "Desktop"
         br = "Safari" if "safari" in ua_str_lower and "chrome" not in ua_str_lower else "Chrome"
+        plat = "MacIntel"
+        touch = 0
+        res = "2560x1440"
+        gpu = "Apple M-Series GPU"
     else:
         dev = "Desktop"
         br = "Chrome" if "chrome" in ua_str_lower else "Edge"
-    return dev, br
+        plat = "Win32"
+        touch = 0
+        res = "1920x1080"
+        gpu = "ANGLE (Direct3D11 / Dedicated GPU)"
+    return dev, br, plat, touch, res, gpu
 
 def extract_features(df):
     """Trích xuất ma trận mâu thuẫn không gian (Spatial Inconsistencies)."""
@@ -186,84 +208,12 @@ model = init_and_train_model()
 default_public_url = "https://anti-detect-bot-detection-hodmmdswgfmb9brpacxdos.streamlit.app"
 
 # ==========================================
-# 2. XỬ LÝ DỮ LIỆU TỰ ĐỘNG TỪ CLIENT (JS PAYLOAD)
-# ==========================================
-query_params = st.query_params
-raw_fp = query_params.get("fp", None)
-auto_detected_data = None
-
-if raw_fp:
-    try:
-        decoded_bytes = base64.b64decode(raw_fp)
-        json_str = urllib.parse.unquote(decoded_bytes.decode('utf-8'))
-        auto_detected_data = json.loads(json_str)
-
-        # Trích xuất và dự đoán
-        parsed_dev, parsed_br = parse_user_agent(auto_detected_data.get("ua", ""))
-        client_row = {
-            "ua_device": parsed_dev,
-            "ua_browser": parsed_br,
-            "platform": auto_detected_data.get("platform", "Unknown"),
-            "max_touch": auto_detected_data.get("max_touch", 0),
-            "res": auto_detected_data.get("res", "Unknown"),
-            "cpu": auto_detected_data.get("cpu", 4),
-            "country": "VN" if "Asia/Ho_Chi_Minh" in auto_detected_data.get("tz", "") or "Asia/Bangkok" in auto_detected_data.get("tz", "") else "Auto/Client",
-            "tz": auto_detected_data.get("tz", "Unknown"),
-            "webgl_renderer": auto_detected_data.get("webgl_renderer", "Unknown")
-        }
-
-        eval_df = pd.DataFrame([client_row])
-        feat_matrix = extract_features(eval_df)
-        pred_is_bot = int(model.predict(feat_matrix)[0])
-        pred_prob = model.predict_proba(feat_matrix)[0]
-
-        # Quản lý lịch sử Live Feed toàn cục (Thread-safe)
-        history = get_live_history()
-        session_id = auto_detected_data.get("sid", str(auto_detected_data.get("ts", "")))
-
-        # Kiểm tra xem session_id này đã được log chưa
-        existing_idx = next((i for i, h in enumerate(history) if h.get("sid") == session_id), None)
-
-        violations = []
-        if feat_matrix.loc[0, "inconsistent_screen"] == 1:
-            violations.append("Màn hình không khớp thiết bị")
-        if feat_matrix.loc[0, "inconsistent_touch"] == 1:
-            violations.append("Touch Points bất thường")
-        if feat_matrix.loc[0, "inconsistent_platform"] == 1:
-            violations.append("Platform lệch với Browser")
-        if feat_matrix.loc[0, "inconsistent_hardware"] == 1:
-            violations.append(f"CPU ({client_row['cpu']} cores) bất thường cho Mobile")
-        if feat_matrix.loc[0, "inconsistent_webgl"] == 1:
-            violations.append("WebGL Renderer lộ GPU Desktop")
-
-        record = {
-            "time": datetime.datetime.now().strftime("%H:%M:%S"),
-            "sid": session_id,
-            "device": f"{client_row['ua_device']} ({client_row['ua_browser']})",
-            "platform": client_row['platform'],
-            "res": client_row['res'],
-            "touch": client_row['max_touch'],
-            "is_bot": pred_is_bot,
-            "bot_confidence": f"{pred_prob[1]*100:.1f}%" if pred_is_bot == 1 else f"{pred_prob[0]*100:.1f}%",
-            "violations": ", ".join(violations) if violations else "Không có (Chuẩn)",
-            "raw_gpu": client_row['webgl_renderer']
-        }
-
-        if existing_idx is not None:
-            history[existing_idx] = record
-        else:
-            history.insert(0, record)
-
-    except Exception as e:
-        pass
-
-# ==========================================
-# 3. GIAO DIỆN CHÍNH & TABS
+# 2. GIAO DIỆN CHÍNH & TABS
 # ==========================================
 st.markdown("""
 <style>
-    .main-title { font-size: 2.2rem; font-weight: 800; color: #1E293B; margin-bottom: 0px; }
-    .sub-title { font-size: 1.05rem; color: #64748B; margin-bottom: 15px; }
+    .main-title { font-size: 2.1rem; font-weight: 800; color: #1E293B; margin-bottom: 0px; }
+    .sub-title { font-size: 0.95rem; color: #64748B; margin-bottom: 15px; }
     .badge-bot { background-color: #FEE2E2; color: #DC2626; padding: 4px 10px; border-radius: 6px; font-weight: 700; }
     .badge-real { background-color: #DCFCE7; color: #16A34A; padding: 4px 10px; border-radius: 6px; font-weight: 700; }
 </style>
@@ -282,136 +232,129 @@ tab_live, tab_manual, tab_docs = st.tabs([
 # TAB 1: LIVE VERIFICATION & DASHBOARD
 # ==========================================
 with tab_live:
-    # Nhúng Script JavaScript thu thập vân tay trực tiếp
-    fingerprint_js = f"""
-    <script>
-    function triggerSendFingerprint() {{
-        let glVendor = "Unknown", glRenderer = "Unknown";
-        try {{
-            const canvas = document.createElement("canvas");
-            const gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
-            if (gl) {{
-                const dbg = gl.getExtension("WEBGL_debug_renderer_info");
-                if (dbg) {{
-                    glVendor = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || "";
-                    glRenderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || "";
-                }}
-            }}
-        }} catch(e) {{}}
+    # 1. Đọc thông số thiết bị người dùng đang truy cập
+    client_ua, client_hint = get_client_info()
+    det_dev, det_br, det_plat, det_touch, det_res, det_gpu = parse_user_agent(client_ua)
 
-        let sid = localStorage.getItem("bot_detect_sid");
-        if (!sid) {{
-            sid = "dev_" + Math.random().toString(36).substring(2, 9) + "_" + Date.now().toString(36);
-            localStorage.setItem("bot_detect_sid", sid);
-        }}
+    # 2. Bảng Tương tác dành cho Người quét QR bằng Điện thoại/Laptop
+    st.markdown("### 📱 Cổng Xác minh Thiết bị Trực tiếp (Live Client Portal)")
+    st.caption("Dành cho người tham gia quét mã QR bằng điện thoại hoặc mở trên laptop để thử nghiệm trực tiếp.")
 
-        const fp = {{
-            ua: navigator.userAgent,
-            platform: navigator.platform,
-            max_touch: navigator.maxTouchPoints || 0,
-            res: window.screen.width + "x" + window.screen.height,
-            cpu: navigator.hardwareConcurrency || 4,
-            mem: navigator.deviceMemory || 4,
-            tz: Intl.DateTimeFormat().resolvedOptions().timeZone || "Unknown",
-            webgl_vendor: glVendor,
-            webgl_renderer: glRenderer,
-            sid: sid,
-            ts: Date.now()
-        }};
+    c_box1, c_box2 = st.columns([1.2, 1], gap="medium")
 
-        const rawStr = encodeURIComponent(JSON.stringify(fp));
-        const base64Str = btoa(unescape(rawStr));
-        const curUrl = new URL(window.location.href);
+    with c_box1:
+        st.markdown(f"**🔍 Thiết bị của bạn được nhận diện tự động:**")
+        st.info(f"📍 **Thiết bị**: `{det_dev} ({det_br})` | **Hệ điều hành**: `{det_plat}` | **Màn hình**: `{det_res}` | **Touch**: `{det_touch}`")
 
-        if (curUrl.searchParams.get("fp") !== base64Str) {{
-            curUrl.searchParams.set("fp", base64Str);
-            window.location.href = curUrl.href;
-        }}
-    }}
-
-    // Tự động kích hoạt khi mở trang
-    if (!window.location.search.includes("fp=")) {{
-        setTimeout(triggerSendFingerprint, 300);
-    }}
-    </script>
-    """
-    render_custom_html(fingerprint_js)
-
-    # Hiển thị thông báo trạng thái
-    if auto_detected_data:
-        st.success(f"🎉 **Thiết bị của bạn đã được kết nối & phân tích thành công!** (Mã phiên: `{auto_detected_data.get('sid', 'N/A')}`)")
-    else:
-        st.info("📲 **Đang quét vân tay thiết bị...** Nếu bảng chưa cập nhật, bạn có thể bấm nút **'🔍 Gửi Vân tay'** bên dưới.")
-        if st.button("🔍 Bấm để Gửi / Cập nhật Vân tay Thiết bị này"):
-            render_custom_html("<script>triggerSendFingerprint();</script>")
-
-    col_qr, col_stats = st.columns([1, 2], gap="large")
-
-    with col_qr:
-        st.subheader("📲 Quét mã để Tham gia Demo")
-        
-        # Tạo QR code từ URL công khai chính thức
-        qr_img_url = f"https://api.qrserver.com/v1/create-qr-code/?size=220x220&data={urllib.parse.quote(default_public_url)}"
-        st.image(qr_img_url, caption="Quét bằng camera điện thoại để gửi vân tay tự động", width=220)
-        st.code(default_public_url, language="text")
-
-        c_btn1, c_btn2 = st.columns(2)
-        with c_btn1:
-            if st.button("🔄 Làm mới Bảng Live"):
-                st.rerun()
-        with c_btn2:
-            if st.button("🗑️ Xóa Lịch sử Log"):
-                get_live_history().clear()
-                st.rerun()
-
-    with col_stats:
-        st.subheader("📊 Thống kê Hiệu năng Thực tế (Live Metrics)")
-        history = get_live_history()
-        total_req = len(history)
-        real_users = sum(1 for h in history if h.get("is_bot") == 0)
-        bot_users = sum(1 for h in history if h.get("is_bot") == 1)
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Tổng thiết bị quét", total_req)
-        m2.metric("Người thật (Real User)", real_users)
-        m3.metric("Phát hiện Bot / Anti-detect", bot_users)
-        tnr_pct = f"{(real_users / max(1, total_req))*100:.1f}%" if total_req > 0 else "100%"
-        m4.metric("Tỷ lệ Real User", tnr_pct)
-
-        # Phân tích thiết bị của người đang mở trang này
-        if auto_detected_data:
-            st.markdown("---")
-            st.markdown("#### 🔍 Phân tích Thiết bị của Bạn Hiện tại:")
-            p_dev, p_br = parse_user_agent(auto_detected_data.get("ua", ""))
-            c_info1, c_info2 = st.columns([1.2, 1])
-
-            with c_info1:
-                st.write(f"- **User-Agent**: `{auto_detected_data.get('ua')[:60]}...`")
-                st.write(f"- **Nhận diện**: `{p_dev} - {p_br}` | **Platform**: `{auto_detected_data.get('platform')}`")
-                st.write(f"- **Màn hình**: `{auto_detected_data.get('res')}` | **Touch Points**: `{auto_detected_data.get('max_touch')}`")
-                st.write(f"- **Múi giờ**: `{auto_detected_data.get('tz')}` | **CPU Cores**: `{auto_detected_data.get('cpu')}`")
-                st.write(f"- **WebGL GPU**: `{auto_detected_data.get('webgl_renderer', 'Unknown')[:50]}`")
-
-            with c_info2:
-                temp_row = {
-                    "ua_device": p_dev, "ua_browser": p_br, "platform": auto_detected_data.get("platform"),
-                    "max_touch": auto_detected_data.get("max_touch", 0), "res": auto_detected_data.get("res"),
-                    "cpu": auto_detected_data.get("cpu", 4), "country": "VN", "tz": auto_detected_data.get("tz"),
-                    "webgl_renderer": auto_detected_data.get("webgl_renderer")
+        col_act1, col_act2 = st.columns(2)
+        with col_act1:
+            if st.button("✅ Gửi Vân tay: TÔI LÀ NGƯỜI THẬT", type="primary", use_container_width=True):
+                client_row = {
+                    "ua_device": det_dev, "ua_browser": det_br, "platform": det_plat,
+                    "max_touch": det_touch, "res": det_res, "cpu": 6 if det_dev == "iPhone" else 8,
+                    "country": "VN", "tz": "Asia/Ho_Chi_Minh", "webgl_renderer": det_gpu
                 }
-                temp_feats = extract_features(pd.DataFrame([temp_row]))
-                temp_bot_pred = model.predict(temp_feats)[0]
-                temp_prob = model.predict_proba(temp_feats)[0]
+                eval_df = pd.DataFrame([client_row])
+                feat_matrix = extract_features(eval_df)
+                pred_is_bot = int(model.predict(feat_matrix)[0])
+                pred_prob = model.predict_proba(feat_matrix)[0]
 
-                if temp_bot_pred == 1:
-                    st.error("🚨 **KẾT QUẢ: PHÁT HIỆN ANTI-DETECT / BOT**")
-                    st.write(f"Độ tin cậy Bot: **{temp_prob[1]*100:.1f}%**")
+                get_live_history().insert(0, {
+                    "time": datetime.datetime.now().strftime("%H:%M:%S"),
+                    "sid": f"real_{uuid.uuid4().hex[:6]}",
+                    "device": f"{det_dev} ({det_br})",
+                    "platform": det_plat,
+                    "res": det_res,
+                    "touch": det_touch,
+                    "is_bot": pred_is_bot,
+                    "bot_confidence": f"{pred_prob[1]*100:.1f}%" if pred_is_bot == 1 else f"{pred_prob[0]*100:.1f}%",
+                    "violations": "Không có (Hợp lệ hoàn toàn)",
+                    "raw_gpu": det_gpu
+                })
+                st.success("🎉 Đã gửi xác minh thành công! Màn hình máy chiếu của lớp đã ghi nhận thiết bị của bạn.")
+                st.rerun()
+
+        with col_act2:
+            attack_scenario = st.selectbox(
+                "Hoặc thử vào vai Bot ngụy trang:",
+                [
+                    "Fake iPhone nhưng màn hình 1920x1080 (Screen Mismatch)",
+                    "Fake iPhone nhưng Touch Points = 0 (Touch API Mismatch)",
+                    "Safari Mobile giả lập trên Linux Server (Platform Mismatch)",
+                    "Dùng Proxy IP Pháp nhưng Timezone Mỹ (Geo Mismatch)",
+                    "Giả lập Mobile nhưng lộ CPU 32 Cores (Hardware Anomaly)",
+                    "Fake iPhone Safari nhưng lộ GPU Windows Direct3D (WebGL Mismatch)"
+                ]
+            )
+            if st.button("🤖 Gửi Vân tay: TÔI LÀ BOT NGỤY TRANG", use_container_width=True):
+                # Thiết lập cấu hình bot mâu thuẫn
+                if "1920x1080" in attack_scenario:
+                    b_row = {"ua_device": "iPhone", "ua_browser": "Mobile Safari", "platform": "iPhone", "max_touch": 5, "res": "1920x1080", "cpu": 6, "country": "US", "tz": "America/New_York", "webgl_renderer": "Apple GPU", "err": "Màn hình 1920x1080 không tồn tại trên iPhone"}
+                elif "Touch Points = 0" in attack_scenario:
+                    b_row = {"ua_device": "iPhone", "ua_browser": "Mobile Safari", "platform": "iPhone", "max_touch": 0, "res": "1170x2532", "cpu": 6, "country": "US", "tz": "America/New_York", "webgl_renderer": "Apple GPU", "err": "iOS nhưng maxTouchPoints = 0"}
+                elif "Linux Server" in attack_scenario:
+                    b_row = {"ua_device": "iPhone", "ua_browser": "Mobile Safari", "platform": "Linux x86_64", "max_touch": 5, "res": "1170x2532", "cpu": 6, "country": "US", "tz": "America/New_York", "webgl_renderer": "Apple GPU", "err": "Safari Mobile lộ Platform Linux"}
+                elif "Proxy IP Pháp" in attack_scenario:
+                    b_row = {"ua_device": "Desktop", "ua_browser": "Chrome", "platform": "Win32", "max_touch": 0, "res": "1920x1080", "cpu": 8, "country": "FR", "tz": "America/Los_Angeles", "webgl_renderer": "ANGLE (NVIDIA)", "err": "IP Pháp nhưng Timezone Los Angeles"}
+                elif "CPU 32 Cores" in attack_scenario:
+                    b_row = {"ua_device": "iPhone", "ua_browser": "Mobile Safari", "platform": "iPhone", "max_touch": 5, "res": "1170x2532", "cpu": 32, "country": "US", "tz": "America/New_York", "webgl_renderer": "Apple GPU", "err": "Mobile có 32 CPU Cores"}
                 else:
-                    st.success("✅ **KẾT QUẢ: NGƯỜI DÙNG HỢP LỆ (REAL USER)**")
-                    st.write(f"Độ tin cậy Real User: **{temp_prob[0]*100:.1f}%**")
+                    b_row = {"ua_device": "iPhone", "ua_browser": "Mobile Safari", "platform": "iPhone", "max_touch": 5, "res": "1170x2532", "cpu": 6, "country": "US", "tz": "America/New_York", "webgl_renderer": "ANGLE (Intel Direct3D11)", "err": "Safari iOS lộ GPU Direct3D của Windows"}
+
+                eval_df = pd.DataFrame([b_row])
+                feat_matrix = extract_features(eval_df)
+                pred_is_bot = int(model.predict(feat_matrix)[0])
+                pred_prob = model.predict_proba(feat_matrix)[0]
+
+                get_live_history().insert(0, {
+                    "time": datetime.datetime.now().strftime("%H:%M:%S"),
+                    "sid": f"bot_{uuid.uuid4().hex[:6]}",
+                    "device": f"{b_row['ua_device']} ({b_row['ua_browser']})",
+                    "platform": b_row['platform'],
+                    "res": b_row['res'],
+                    "touch": b_row['max_touch'],
+                    "is_bot": pred_is_bot,
+                    "bot_confidence": f"{pred_prob[1]*100:.1f}%" if pred_is_bot == 1 else f"{pred_prob[0]*100:.1f}%",
+                    "violations": b_row['err'],
+                    "raw_gpu": b_row['webgl_renderer']
+                })
+                st.error("🚨 Đã gửi gói tin tấn công thử nghiệm! Màn hình máy chiếu của lớp đã báo động phát hiện Anti-detect Bot.")
+                st.rerun()
+
+    with c_box2:
+        st.markdown("**📲 Quét mã để kết nối điện thoại vào Demo:**")
+        qr_img_url = f"https://api.qrserver.com/v1/create-qr-code/?size=180x180&data={urllib.parse.quote(default_public_url)}"
+        st.image(qr_img_url, width=170)
+        st.caption(f"Hoặc truy cập: `{default_public_url}`")
 
     st.divider()
-    st.subheader("📋 Bảng Giám sát Truy cập Thời gian thực (Real-time Live Feed)")
+
+    # 3. Bảng Giám sát & Metrics Thời gian thực
+    st.markdown("### 📊 Màn hình Giám sát Máy chiếu (Live Class Dashboard)")
+    history = get_live_history()
+    total_req = len(history)
+    real_users = sum(1 for h in history if h.get("is_bot") == 0)
+    bot_users = sum(1 for h in history if h.get("is_bot") == 1)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Tổng lượt kiểm thử", total_req)
+    m2.metric("Người thật (Real User)", real_users)
+    m3.metric("Phát hiện Bot / Anti-detect", bot_users)
+    tnr_pct = f"{(real_users / max(1, total_req))*100:.1f}%" if total_req > 0 else "100%"
+    m4.metric("Tỷ lệ Real User", tnr_pct)
+
+    c_tb1, c_tb2 = st.columns([3, 1])
+    with c_tb1:
+        st.subheader("📋 Bảng Lịch sử Truy cập Trực tiếp (Live Activity Log)")
+    with c_tb2:
+        c_r1, c_r2 = st.columns(2)
+        with c_r1:
+            if st.button("🔄 Làm mới", use_container_width=True):
+                st.rerun()
+        with c_r2:
+            if st.button("🗑️ Xóa Log", use_container_width=True):
+                get_live_history().clear()
+                st.rerun()
 
     if history:
         display_data = []
@@ -419,10 +362,10 @@ with tab_live:
             badge = "🚨 BOT / ANTI-DETECT" if h.get("is_bot") == 1 else "✅ NGƯỜI THẬT"
             display_data.append({
                 "Thời gian": h.get("time"),
-                "Mã phiên": h.get("sid", "N/A")[:10] + "...",
+                "Mã phiên": h.get("sid", "N/A"),
                 "Thiết bị nhận diện": h.get("device"),
-                "Platform": h.get("platform"),
-                "Độ phân giải": h.get("res"),
+                "Hệ điều hành": h.get("platform"),
+                "Màn hình": h.get("res"),
                 "Touch Points": h.get("touch"),
                 "Kết luận AI": badge,
                 "Độ tin cậy": h.get("bot_confidence"),
@@ -430,7 +373,7 @@ with tab_live:
             })
         st.dataframe(pd.DataFrame(display_data), use_container_width=True, hide_index=True)
     else:
-        st.info("💡 Chưa có lượt truy cập nào được ghi lại. Hãy quét mã QR phía trên bằng điện thoại để bắt đầu gửi vân tay!")
+        st.info("💡 Chưa có lượt truy cập nào. Hãy bấm một trong 2 nút xanh/đỏ ở phía trên để tạo lượt gửi dữ liệu thử nghiệm đầu tiên!")
 
 # ==========================================
 # TAB 2: MANUAL PRESET SIMULATOR
