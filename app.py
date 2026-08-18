@@ -6,10 +6,8 @@ from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import json
 import base64
-import socket
 import datetime
 import urllib.parse
-import time
 
 # Cấu hình giao diện Streamlit
 st.set_page_config(
@@ -18,23 +16,19 @@ st.set_page_config(
     page_icon="🛡️"
 )
 
-# ==========================================
-# 0. HỖ TRỢ MẠNG VÀ BỘ NHỚ LỊCH SỬ (CACHE)
-# ==========================================
-def get_local_ip():
-    """Lấy địa chỉ IP mạng nội bộ (LAN) làm fallback."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "localhost"
+# Helper an toàn để render HTML không tạo iframe
+def render_custom_html(html_str):
+    if hasattr(st, "html"):
+        st.html(html_str)
+    elif hasattr(st, "components") and hasattr(st.components, "v1"):
+        st.components.v1.html(html_str, height=0)
 
+# ==========================================
+# 0. HỖ TRỢ BỘ NHỚ LỊCH SỬ (CACHE)
+# ==========================================
 @st.cache_resource
 def get_live_history():
-    """Lưu trữ lịch sử các thiết bị truy cập thực nghiệm (Thread-safe singleton)."""
+    """Lưu trữ danh sách các thiết bị truy cập thực nghiệm (Thread-safe singleton)."""
     return []
 
 # ==========================================
@@ -45,7 +39,6 @@ def init_and_train_model():
     np.random.seed(42)
     n_samples = 10000
 
-    # Cấu hình chuẩn của người dùng thật (Benign profiles)
     real_configs = [
         {
             "ua_device": "iPhone", "ua_browser": "Mobile Safari", "platform": "iPhone",
@@ -159,7 +152,7 @@ def extract_features(df):
         else 0 for _, row in df.iterrows()
     ]
 
-    # 3. Platform Inconsistency (OS vs Navigator Platform)
+    # 3. Platform Inconsistency
     features["inconsistent_platform"] = [
         1 if ("safari" in str(row.get("ua_browser", "")).lower() and any(p in str(row.get("platform", "")).lower() for p in ["linux", "win32", "windows"]))
         else 0 for _, row in df.iterrows()
@@ -190,7 +183,6 @@ def extract_features(df):
 
 # Khởi tạo mô hình
 model = init_and_train_model()
-local_ip = get_local_ip()
 default_public_url = "https://anti-detect-bot-detection-hcdmmdswgfmb9brpacxdos.streamlit.app"
 
 # ==========================================
@@ -205,10 +197,6 @@ if raw_fp:
         decoded_bytes = base64.b64decode(raw_fp)
         json_str = urllib.parse.unquote(decoded_bytes.decode('utf-8'))
         auto_detected_data = json.loads(json_str)
-
-        # Lưu URL gốc của trình duyệt
-        if "origin" in auto_detected_data and auto_detected_data["origin"]:
-            st.session_state["public_url"] = auto_detected_data["origin"]
 
         # Trích xuất và dự đoán
         parsed_dev, parsed_br = parse_user_agent(auto_detected_data.get("ua", ""))
@@ -269,9 +257,6 @@ if raw_fp:
     except Exception as e:
         pass
 
-# URL công khai
-current_public_url = st.session_state.get("public_url", default_public_url)
-
 # ==========================================
 # 3. GIAO DIỆN CHÍNH & TABS
 # ==========================================
@@ -279,7 +264,6 @@ st.markdown("""
 <style>
     .main-title { font-size: 2.2rem; font-weight: 800; color: #1E293B; margin-bottom: 0px; }
     .sub-title { font-size: 1.05rem; color: #64748B; margin-bottom: 15px; }
-    .metric-box { background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 10px; padding: 15px; text-align: center; }
     .badge-bot { background-color: #FEE2E2; color: #DC2626; padding: 4px 10px; border-radius: 6px; font-weight: 700; }
     .badge-real { background-color: #DCFCE7; color: #16A34A; padding: 4px 10px; border-radius: 6px; font-weight: 700; }
 </style>
@@ -298,113 +282,78 @@ tab_live, tab_manual, tab_docs = st.tabs([
 # TAB 1: LIVE VERIFICATION & DASHBOARD
 # ==========================================
 with tab_live:
-    # Nhúng Script JavaScript thu thập vân tay
-    js_fingerprint_script = f"""
+    # Nhúng Script JavaScript thu thập vân tay trực tiếp
+    fingerprint_js = f"""
     <script>
-    (function() {{
-        function getSafeParentUrl() {{
-            try {{
-                if (window.top && window.top.location && window.top.location.href) {{
-                    return new URL(window.top.location.href);
+    function triggerSendFingerprint() {{
+        let glVendor = "Unknown", glRenderer = "Unknown";
+        try {{
+            const canvas = document.createElement("canvas");
+            const gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+            if (gl) {{
+                const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+                if (dbg) {{
+                    glVendor = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || "";
+                    glRenderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || "";
                 }}
-            }} catch(e) {{}}
-            try {{
-                if (document.referrer) {{
-                    return new URL(document.referrer);
-                }}
-            }} catch(e) {{}}
-            return new URL("{default_public_url}");
+            }}
+        }} catch(e) {{}}
+
+        let sid = localStorage.getItem("bot_detect_sid");
+        if (!sid) {{
+            sid = "dev_" + Math.random().toString(36).substring(2, 9) + "_" + Date.now().toString(36);
+            localStorage.setItem("bot_detect_sid", sid);
         }}
 
-        function collectAndNavigate() {{
-            let glVendor = "Unknown", glRenderer = "Unknown";
-            try {{
-                const canvas = document.createElement("canvas");
-                const gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
-                if (gl) {{
-                    const dbg = gl.getExtension("WEBGL_debug_renderer_info");
-                    if (dbg) {{
-                        glVendor = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || "";
-                        glRenderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || "";
-                    }}
-                }}
-            }} catch(e) {{}}
+        const fp = {{
+            ua: navigator.userAgent,
+            platform: navigator.platform,
+            max_touch: navigator.maxTouchPoints || 0,
+            res: window.screen.width + "x" + window.screen.height,
+            cpu: navigator.hardwareConcurrency || 4,
+            mem: navigator.deviceMemory || 4,
+            tz: Intl.DateTimeFormat().resolvedOptions().timeZone || "Unknown",
+            webgl_vendor: glVendor,
+            webgl_renderer: glRenderer,
+            sid: sid,
+            ts: Date.now()
+        }};
 
-            let sid = localStorage.getItem("bot_detect_sid");
-            if (!sid) {{
-                sid = "dev_" + Math.random().toString(36).substring(2, 9) + "_" + Date.now().toString(36);
-                localStorage.setItem("bot_detect_sid", sid);
-            }}
+        const rawStr = encodeURIComponent(JSON.stringify(fp));
+        const base64Str = btoa(unescape(rawStr));
+        const curUrl = new URL(window.location.href);
 
-            const parentUrl = getSafeParentUrl();
-            const publicOrigin = parentUrl.origin + parentUrl.pathname;
-
-            const fp = {{
-                ua: navigator.userAgent,
-                platform: navigator.platform,
-                max_touch: navigator.maxTouchPoints || 0,
-                res: window.screen.width + "x" + window.screen.height,
-                cpu: navigator.hardwareConcurrency || 4,
-                mem: navigator.deviceMemory || 4,
-                tz: Intl.DateTimeFormat().resolvedOptions().timeZone || "Unknown",
-                webgl_vendor: glVendor,
-                webgl_renderer: glRenderer,
-                origin: publicOrigin,
-                sid: sid,
-                ts: Date.now()
-            }};
-
-            const rawStr = encodeURIComponent(JSON.stringify(fp));
-            const base64Str = btoa(unescape(rawStr));
-
-            if (parentUrl.searchParams.get("fp") !== base64Str) {{
-                parentUrl.searchParams.set("fp", base64Str);
-                try {{
-                    if (window.top) {{
-                        window.top.location.replace(parentUrl.href);
-                        return;
-                    }}
-                }} catch(e) {{}}
-                window.open(parentUrl.href, "_top");
-            }}
+        if (curUrl.searchParams.get("fp") !== base64Str) {{
+            curUrl.searchParams.set("fp", base64Str);
+            window.location.href = curUrl.href;
         }}
+    }}
 
-        setTimeout(collectAndNavigate, 500);
-    }})();
+    // Tự động kích hoạt khi mở trang
+    if (!window.location.search.includes("fp=")) {{
+        setTimeout(triggerSendFingerprint, 300);
+    }}
     </script>
     """
-    st.components.v1.html(js_fingerprint_script, height=0)
+    render_custom_html(fingerprint_js)
 
-    # Hiển thị thông báo nếu người dùng đang truy cập trên thiết bị di động
+    # Hiển thị thông báo trạng thái
     if auto_detected_data:
         st.success(f"🎉 **Thiết bị của bạn đã được kết nối & phân tích thành công!** (Mã phiên: `{auto_detected_data.get('sid', 'N/A')}`)")
+    else:
+        st.info("📲 **Đang quét vân tay thiết bị...** Nếu bảng chưa cập nhật, bạn có thể bấm nút **'🔍 Gửi Vân tay'** bên dưới.")
+        if st.button("🔍 Bấm để Gửi / Cập nhật Vân tay Thiết bị này"):
+            render_custom_html("<script>triggerSendFingerprint();</script>")
 
     col_qr, col_stats = st.columns([1, 2], gap="large")
 
     with col_qr:
         st.subheader("📲 Quét mã để Tham gia Demo")
         
-        # QR Widget luôn tự động phát hiện đúng Domain Public của trình duyệt
-        qr_widget_html = f"""
-        <div style="text-align: center; background: #ffffff; padding: 12px; border-radius: 12px; border: 1px solid #e2e8f0; max-width: 250px; margin-bottom: 10px;">
-            <img id="live-dynamic-qr" src="https://api.qrserver.com/v1/create-qr-code/?size=220x220&data={urllib.parse.quote(default_public_url)}" style="width: 200px; height: 200px; border-radius: 8px;" />
-            <p id="live-url-text" style="font-size: 0.75rem; color: #475569; margin-top: 8px; word-break: break-all; font-family: monospace; font-weight: bold;">{default_public_url}</p>
-        </div>
-        <script>
-            try {{
-                let u = "{default_public_url}";
-                if (window.top && window.top.location && window.top.location.href) {{
-                    u = window.top.location.origin + window.top.location.pathname;
-                }} else if (document.referrer) {{
-                    const ref = new URL(document.referrer);
-                    u = ref.origin + ref.pathname;
-                }}
-                document.getElementById("live-dynamic-qr").src = "https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=" + encodeURIComponent(u);
-                document.getElementById("live-url-text").innerText = u;
-            }} catch(e) {{}}
-        </script>
-        """
-        st.components.v1.html(qr_widget_html, height=270)
+        # Tạo QR code từ URL công khai chính thức
+        qr_img_url = f"https://api.qrserver.com/v1/create-qr-code/?size=220x220&data={urllib.parse.quote(default_public_url)}"
+        st.image(qr_img_url, caption="Quét bằng camera điện thoại để gửi vân tay tự động", width=220)
+        st.code(default_public_url, language="text")
 
         c_btn1, c_btn2 = st.columns(2)
         with c_btn1:
@@ -429,7 +378,7 @@ with tab_live:
         tnr_pct = f"{(real_users / max(1, total_req))*100:.1f}%" if total_req > 0 else "100%"
         m4.metric("Tỷ lệ Real User", tnr_pct)
 
-        # Hiển thị thông tin phân tích thiết bị hiện tại
+        # Phân tích thiết bị của người đang mở trang này
         if auto_detected_data:
             st.markdown("---")
             st.markdown("#### 🔍 Phân tích Thiết bị của Bạn Hiện tại:")
@@ -462,12 +411,7 @@ with tab_live:
                     st.write(f"Độ tin cậy Real User: **{temp_prob[0]*100:.1f}%**")
 
     st.divider()
-    
-    col_hdr1, col_hdr2 = st.columns([3, 1])
-    with col_hdr1:
-        st.subheader("📋 Bảng Giám sát Truy cập Thời gian thực (Real-time Live Feed)")
-    with col_hdr2:
-        auto_refresh_on = st.toggle("⚡ Tự động cập nhật mỗi 3s", value=True)
+    st.subheader("📋 Bảng Giám sát Truy cập Thời gian thực (Real-time Live Feed)")
 
     if history:
         display_data = []
@@ -486,22 +430,7 @@ with tab_live:
             })
         st.dataframe(pd.DataFrame(display_data), use_container_width=True, hide_index=True)
     else:
-        st.info("💡 Chưa có lượt truy cập nào được ghi lại. Hãy mở camera điện thoại quét mã QR phía trên để bắt đầu gửi vân tay!")
-
-    # Tự động reload trang dashboard mỗi 3 giây nếu bật auto-refresh
-    if auto_refresh_on:
-        st.components.v1.html(
-            """
-            <script>
-            setTimeout(function() {
-                try {
-                    window.parent.postMessage({type: 'streamlit:setComponentValue'}, '*');
-                } catch(e) {}
-            }, 3000);
-            </script>
-            """,
-            height=0
-        )
+        st.info("💡 Chưa có lượt truy cập nào được ghi lại. Hãy quét mã QR phía trên bằng điện thoại để bắt đầu gửi vân tay!")
 
 # ==========================================
 # TAB 2: MANUAL PRESET SIMULATOR
