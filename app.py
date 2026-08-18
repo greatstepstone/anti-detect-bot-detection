@@ -9,6 +9,7 @@ import base64
 import socket
 import datetime
 import urllib.parse
+import time
 
 # Cấu hình giao diện Streamlit
 st.set_page_config(
@@ -21,7 +22,7 @@ st.set_page_config(
 # 0. HỖ TRỢ MẠNG VÀ BỘ NHỚ LỊCH SỬ (CACHE)
 # ==========================================
 def get_local_ip():
-    """Lấy địa chỉ IP mạng nội bộ (LAN) để tạo link và QR Code cho lớp học."""
+    """Lấy địa chỉ IP mạng nội bộ (LAN) làm fallback."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -33,7 +34,7 @@ def get_local_ip():
 
 @st.cache_resource
 def get_live_history():
-    """Lưu trữ lịch sử các thiết bị truy cập thực nghiệm (Thread-safe)."""
+    """Lưu trữ lịch sử các thiết bị truy cập thực nghiệm (Thread-safe singleton)."""
     return []
 
 # ==========================================
@@ -187,10 +188,10 @@ def extract_features(df):
     features["total_inconsistency_score"] = features.sum(axis=1)
     return features
 
-# Huấn luyện mô hình ngay khi khởi động
+# Khởi tạo mô hình
 model = init_and_train_model()
 local_ip = get_local_ip()
-live_url = f"http://{local_ip}:8501"
+default_public_url = "https://anti-detect-bot-detection-hcdmmdswgfmb9brpacxdos.streamlit.app"
 
 # ==========================================
 # 2. XỬ LÝ DỮ LIỆU TỰ ĐỘNG TỪ CLIENT (JS PAYLOAD)
@@ -228,44 +229,48 @@ if raw_fp:
         pred_is_bot = int(model.predict(feat_matrix)[0])
         pred_prob = model.predict_proba(feat_matrix)[0]
 
-        # Kiểm tra xem đã log session này chưa
+        # Quản lý lịch sử Live Feed toàn cục (Thread-safe)
         history = get_live_history()
-        session_ts = auto_detected_data.get("ts", "")
-        already_logged = any(h.get("ts") == session_ts for h in history)
+        session_id = auto_detected_data.get("sid", str(auto_detected_data.get("ts", "")))
 
-        if not already_logged and session_ts != "":
-            # Xác định các lỗi mâu thuẫn
-            violations = []
-            if feat_matrix.loc[0, "inconsistent_screen"] == 1:
-                violations.append("Màn hình không khớp thiết bị")
-            if feat_matrix.loc[0, "inconsistent_touch"] == 1:
-                violations.append("Touch Points bất thường")
-            if feat_matrix.loc[0, "inconsistent_platform"] == 1:
-                violations.append("Platform lệch với Browser")
-            if feat_matrix.loc[0, "inconsistent_hardware"] == 1:
-                violations.append(f"CPU ({client_row['cpu']} cores) bất thường cho Mobile")
-            if feat_matrix.loc[0, "inconsistent_webgl"] == 1:
-                violations.append("WebGL Renderer lộ GPU Desktop")
+        # Kiểm tra xem session_id này đã được log chưa
+        existing_idx = next((i for i, h in enumerate(history) if h.get("sid") == session_id), None)
 
-            history.insert(0, {
-                "time": datetime.datetime.now().strftime("%H:%M:%S"),
-                "ts": session_ts,
-                "device": f"{client_row['ua_device']} ({client_row['ua_browser']})",
-                "platform": client_row['platform'],
-                "res": client_row['res'],
-                "touch": client_row['max_touch'],
-                "is_bot": pred_is_bot,
-                "bot_confidence": f"{pred_prob[1]*100:.1f}%" if pred_is_bot == 1 else f"{pred_prob[0]*100:.1f}%",
-                "violations": ", ".join(violations) if violations else "Không có (Chuẩn)",
-                "raw_gpu": client_row['webgl_renderer']
-            })
+        violations = []
+        if feat_matrix.loc[0, "inconsistent_screen"] == 1:
+            violations.append("Màn hình không khớp thiết bị")
+        if feat_matrix.loc[0, "inconsistent_touch"] == 1:
+            violations.append("Touch Points bất thường")
+        if feat_matrix.loc[0, "inconsistent_platform"] == 1:
+            violations.append("Platform lệch với Browser")
+        if feat_matrix.loc[0, "inconsistent_hardware"] == 1:
+            violations.append(f"CPU ({client_row['cpu']} cores) bất thường cho Mobile")
+        if feat_matrix.loc[0, "inconsistent_webgl"] == 1:
+            violations.append("WebGL Renderer lộ GPU Desktop")
+
+        record = {
+            "time": datetime.datetime.now().strftime("%H:%M:%S"),
+            "sid": session_id,
+            "device": f"{client_row['ua_device']} ({client_row['ua_browser']})",
+            "platform": client_row['platform'],
+            "res": client_row['res'],
+            "touch": client_row['max_touch'],
+            "is_bot": pred_is_bot,
+            "bot_confidence": f"{pred_prob[1]*100:.1f}%" if pred_is_bot == 1 else f"{pred_prob[0]*100:.1f}%",
+            "violations": ", ".join(violations) if violations else "Không có (Chuẩn)",
+            "raw_gpu": client_row['webgl_renderer']
+        }
+
+        if existing_idx is not None:
+            history[existing_idx] = record
+        else:
+            history.insert(0, record)
+
     except Exception as e:
         pass
 
-# Xác định URL hiển thị ưu tiên: URL công khai (Streamlit Cloud) > Mạng LAN
-current_public_url = st.session_state.get("public_url", live_url)
-if "10." in current_public_url and "streamlit.app" not in current_public_url:
-    current_public_url = live_url
+# URL công khai
+current_public_url = st.session_state.get("public_url", default_public_url)
 
 # ==========================================
 # 3. GIAO DIỆN CHÍNH & TABS
@@ -293,11 +298,25 @@ tab_live, tab_manual, tab_docs = st.tabs([
 # TAB 1: LIVE VERIFICATION & DASHBOARD
 # ==========================================
 with tab_live:
-    # Nhúng Script JavaScript để tự động thu thập vân tay khi mở trang
+    # Nhúng Script JavaScript thu thập vân tay
     js_fingerprint_script = f"""
     <script>
     (function() {{
-        function collectFP() {{
+        function getSafeParentUrl() {{
+            try {{
+                if (window.top && window.top.location && window.top.location.href) {{
+                    return new URL(window.top.location.href);
+                }}
+            }} catch(e) {{}}
+            try {{
+                if (document.referrer) {{
+                    return new URL(document.referrer);
+                }}
+            }} catch(e) {{}}
+            return new URL("{default_public_url}");
+        }}
+
+        function collectAndNavigate() {{
             let glVendor = "Unknown", glRenderer = "Unknown";
             try {{
                 const canvas = document.createElement("canvas");
@@ -311,8 +330,14 @@ with tab_live:
                 }}
             }} catch(e) {{}}
 
-            const currentUrl = new URL(window.top.location.href);
-            const publicOrigin = currentUrl.origin + currentUrl.pathname;
+            let sid = localStorage.getItem("bot_detect_sid");
+            if (!sid) {{
+                sid = "dev_" + Math.random().toString(36).substring(2, 9) + "_" + Date.now().toString(36);
+                localStorage.setItem("bot_detect_sid", sid);
+            }}
+
+            const parentUrl = getSafeParentUrl();
+            const publicOrigin = parentUrl.origin + parentUrl.pathname;
 
             const fp = {{
                 ua: navigator.userAgent,
@@ -325,44 +350,57 @@ with tab_live:
                 webgl_vendor: glVendor,
                 webgl_renderer: glRenderer,
                 origin: publicOrigin,
-                ts: sessionStorage.getItem("fp_session_ts") || (function() {{
-                    const t = Date.now().toString();
-                    sessionStorage.setItem("fp_session_ts", t);
-                    return t;
-                }})()
+                sid: sid,
+                ts: Date.now()
             }};
 
             const rawStr = encodeURIComponent(JSON.stringify(fp));
             const base64Str = btoa(unescape(rawStr));
 
-            if (currentUrl.searchParams.get("fp") !== base64Str) {{
-                currentUrl.searchParams.set("fp", base64Str);
-                window.top.location.replace(currentUrl.href);
+            if (parentUrl.searchParams.get("fp") !== base64Str) {{
+                parentUrl.searchParams.set("fp", base64Str);
+                try {{
+                    if (window.top) {{
+                        window.top.location.replace(parentUrl.href);
+                        return;
+                    }}
+                }} catch(e) {{}}
+                window.open(parentUrl.href, "_top");
             }}
         }}
-        setTimeout(collectFP, 400);
+
+        setTimeout(collectAndNavigate, 500);
     }})();
     </script>
     """
     st.components.v1.html(js_fingerprint_script, height=0)
+
+    # Hiển thị thông báo nếu người dùng đang truy cập trên thiết bị di động
+    if auto_detected_data:
+        st.success(f"🎉 **Thiết bị của bạn đã được kết nối & phân tích thành công!** (Mã phiên: `{auto_detected_data.get('sid', 'N/A')}`)")
 
     col_qr, col_stats = st.columns([1, 2], gap="large")
 
     with col_qr:
         st.subheader("📲 Quét mã để Tham gia Demo")
         
-        # Hiển thị Widget QR Code tự động phát hiện đúng Domain Public của trình duyệt
+        # QR Widget luôn tự động phát hiện đúng Domain Public của trình duyệt
         qr_widget_html = f"""
-        <div style="text-align: center; background: #ffffff; padding: 10px; border-radius: 12px; border: 1px solid #e2e8f0; max-width: 250px; margin-bottom: 10px;">
-            <img id="live-dynamic-qr" src="https://api.qrserver.com/v1/create-qr-code/?size=220x220&data={urllib.parse.quote(current_public_url)}" style="width: 200px; height: 200px; border-radius: 8px;" />
-            <p id="live-url-text" style="font-size: 0.8rem; color: #475569; margin-top: 8px; word-break: break-all; font-family: monospace; font-weight: bold;"></p>
+        <div style="text-align: center; background: #ffffff; padding: 12px; border-radius: 12px; border: 1px solid #e2e8f0; max-width: 250px; margin-bottom: 10px;">
+            <img id="live-dynamic-qr" src="https://api.qrserver.com/v1/create-qr-code/?size=220x220&data={urllib.parse.quote(default_public_url)}" style="width: 200px; height: 200px; border-radius: 8px;" />
+            <p id="live-url-text" style="font-size: 0.75rem; color: #475569; margin-top: 8px; word-break: break-all; font-family: monospace; font-weight: bold;">{default_public_url}</p>
         </div>
         <script>
             try {{
-                const cur = new URL(window.top.location.href);
-                const actualUrl = cur.origin + cur.pathname;
-                document.getElementById("live-dynamic-qr").src = "https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=" + encodeURIComponent(actualUrl);
-                document.getElementById("live-url-text").innerText = actualUrl;
+                let u = "{default_public_url}";
+                if (window.top && window.top.location && window.top.location.href) {{
+                    u = window.top.location.origin + window.top.location.pathname;
+                }} else if (document.referrer) {{
+                    const ref = new URL(document.referrer);
+                    u = ref.origin + ref.pathname;
+                }}
+                document.getElementById("live-dynamic-qr").src = "https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=" + encodeURIComponent(u);
+                document.getElementById("live-url-text").innerText = u;
             }} catch(e) {{}}
         </script>
         """
@@ -385,13 +423,13 @@ with tab_live:
         bot_users = sum(1 for h in history if h.get("is_bot") == 1)
 
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Tổng lượt truy cập", total_req)
+        m1.metric("Tổng thiết bị quét", total_req)
         m2.metric("Người thật (Real User)", real_users)
         m3.metric("Phát hiện Bot / Anti-detect", bot_users)
         tnr_pct = f"{(real_users / max(1, total_req))*100:.1f}%" if total_req > 0 else "100%"
-        m4.metric("Tỷ lệ phản hồi", tnr_pct)
+        m4.metric("Tỷ lệ Real User", tnr_pct)
 
-        # Hiển thị thông tin thiết bị đang mở trang hiện tại
+        # Hiển thị thông tin phân tích thiết bị hiện tại
         if auto_detected_data:
             st.markdown("---")
             st.markdown("#### 🔍 Phân tích Thiết bị của Bạn Hiện tại:")
@@ -406,7 +444,6 @@ with tab_live:
                 st.write(f"- **WebGL GPU**: `{auto_detected_data.get('webgl_renderer', 'Unknown')[:50]}`")
 
             with c_info2:
-                # Dự đoán thiết bị hiện tại
                 temp_row = {
                     "ua_device": p_dev, "ua_browser": p_br, "platform": auto_detected_data.get("platform"),
                     "max_touch": auto_detected_data.get("max_touch", 0), "res": auto_detected_data.get("res"),
@@ -425,13 +462,20 @@ with tab_live:
                     st.write(f"Độ tin cậy Real User: **{temp_prob[0]*100:.1f}%**")
 
     st.divider()
-    st.subheader("📋 Bảng Giám sát Truy cập Thời gian thực (Real-time Live Feed)")
+    
+    col_hdr1, col_hdr2 = st.columns([3, 1])
+    with col_hdr1:
+        st.subheader("📋 Bảng Giám sát Truy cập Thời gian thực (Real-time Live Feed)")
+    with col_hdr2:
+        auto_refresh_on = st.toggle("⚡ Tự động cập nhật mỗi 3s", value=True)
+
     if history:
         display_data = []
         for h in history:
             badge = "🚨 BOT / ANTI-DETECT" if h.get("is_bot") == 1 else "✅ NGƯỜI THẬT"
             display_data.append({
                 "Thời gian": h.get("time"),
+                "Mã phiên": h.get("sid", "N/A")[:10] + "...",
                 "Thiết bị nhận diện": h.get("device"),
                 "Platform": h.get("platform"),
                 "Độ phân giải": h.get("res"),
@@ -442,7 +486,22 @@ with tab_live:
             })
         st.dataframe(pd.DataFrame(display_data), use_container_width=True, hide_index=True)
     else:
-        st.info("💡 Chưa có lượt truy cập nào được ghi lại. Hãy mở camera điện thoại quét mã QR phía trên hoặc mở một tab trình duyệt khác để bắt đầu gửi vân tay!")
+        st.info("💡 Chưa có lượt truy cập nào được ghi lại. Hãy mở camera điện thoại quét mã QR phía trên để bắt đầu gửi vân tay!")
+
+    # Tự động reload trang dashboard mỗi 3 giây nếu bật auto-refresh
+    if auto_refresh_on:
+        st.components.v1.html(
+            """
+            <script>
+            setTimeout(function() {
+                try {
+                    window.parent.postMessage({type: 'streamlit:setComponentValue'}, '*');
+                } catch(e) {}
+            }, 3000);
+            </script>
+            """,
+            height=0
+        )
 
 # ==========================================
 # TAB 2: MANUAL PRESET SIMULATOR
