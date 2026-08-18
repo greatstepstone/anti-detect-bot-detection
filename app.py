@@ -205,6 +205,10 @@ if raw_fp:
         json_str = urllib.parse.unquote(decoded_bytes.decode('utf-8'))
         auto_detected_data = json.loads(json_str)
 
+        # Lưu URL gốc của trình duyệt
+        if "origin" in auto_detected_data and auto_detected_data["origin"]:
+            st.session_state["public_url"] = auto_detected_data["origin"]
+
         # Trích xuất và dự đoán
         parsed_dev, parsed_br = parse_user_agent(auto_detected_data.get("ua", ""))
         client_row = {
@@ -258,6 +262,11 @@ if raw_fp:
     except Exception as e:
         pass
 
+# Xác định URL hiển thị ưu tiên: URL công khai (Streamlit Cloud) > Mạng LAN
+current_public_url = st.session_state.get("public_url", live_url)
+if "10." in current_public_url and "streamlit.app" not in current_public_url:
+    current_public_url = live_url
+
 # ==========================================
 # 3. GIAO DIỆN CHÍNH & TABS
 # ==========================================
@@ -302,6 +311,9 @@ with tab_live:
                 }}
             }} catch(e) {{}}
 
+            const currentUrl = new URL(window.top.location.href);
+            const publicOrigin = currentUrl.origin + currentUrl.pathname;
+
             const fp = {{
                 ua: navigator.userAgent,
                 platform: navigator.platform,
@@ -312,6 +324,7 @@ with tab_live:
                 tz: Intl.DateTimeFormat().resolvedOptions().timeZone || "Unknown",
                 webgl_vendor: glVendor,
                 webgl_renderer: glRenderer,
+                origin: publicOrigin,
                 ts: sessionStorage.getItem("fp_session_ts") || (function() {{
                     const t = Date.now().toString();
                     sessionStorage.setItem("fp_session_ts", t);
@@ -321,7 +334,6 @@ with tab_live:
 
             const rawStr = encodeURIComponent(JSON.stringify(fp));
             const base64Str = btoa(unescape(rawStr));
-            const currentUrl = new URL(window.top.location.href);
 
             if (currentUrl.searchParams.get("fp") !== base64Str) {{
                 currentUrl.searchParams.set("fp", base64Str);
@@ -339,11 +351,22 @@ with tab_live:
     with col_qr:
         st.subheader("📲 Quét mã để Tham gia Demo")
         
-        custom_url = st.text_input("🔗 URL Tham gia (Public / Cloud / LAN):", value=live_url, help="Dán URL Streamlit Cloud hoặc link công khai của bạn vào đây để QR Code tự cập nhật.")
-        target_url = custom_url.strip() if custom_url else live_url
-
-        qr_img_url = f"https://api.qrserver.com/v1/create-qr-code/?size=220x220&data={urllib.parse.quote(target_url)}"
-        st.image(qr_img_url, caption=f"Quét bằng camera điện thoại để gửi vân tay tự động", width=220)
+        # Hiển thị Widget QR Code tự động phát hiện đúng Domain Public của trình duyệt
+        qr_widget_html = f"""
+        <div style="text-align: center; background: #ffffff; padding: 10px; border-radius: 12px; border: 1px solid #e2e8f0; max-width: 250px; margin-bottom: 10px;">
+            <img id="live-dynamic-qr" src="https://api.qrserver.com/v1/create-qr-code/?size=220x220&data={urllib.parse.quote(current_public_url)}" style="width: 200px; height: 200px; border-radius: 8px;" />
+            <p id="live-url-text" style="font-size: 0.8rem; color: #475569; margin-top: 8px; word-break: break-all; font-family: monospace; font-weight: bold;"></p>
+        </div>
+        <script>
+            try {{
+                const cur = new URL(window.top.location.href);
+                const actualUrl = cur.origin + cur.pathname;
+                document.getElementById("live-dynamic-qr").src = "https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=" + encodeURIComponent(actualUrl);
+                document.getElementById("live-url-text").innerText = actualUrl;
+            }} catch(e) {{}}
+        </script>
+        """
+        st.components.v1.html(qr_widget_html, height=270)
 
         c_btn1, c_btn2 = st.columns(2)
         with c_btn1:
