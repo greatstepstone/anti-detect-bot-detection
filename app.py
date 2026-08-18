@@ -183,7 +183,7 @@ def extract_features(df):
 
 # Khởi tạo mô hình
 model = init_and_train_model()
-default_public_url = "https://anti-detect-bot-detection-hcdmmdswgfmb9brpacxdos.streamlit.app"
+default_public_url = "https://anti-detect-bot-detection-hodmmdswgfmb9brpacxdos.streamlit.app"
 
 # ==========================================
 # 2. XỬ LÝ DỮ LIỆU TỰ ĐỘNG TỪ CLIENT (JS PAYLOAD)
